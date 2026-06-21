@@ -274,7 +274,25 @@ body{
 .sparkline-wrapper::-webkit-scrollbar{height:8px;}
 .sparkline-wrapper::-webkit-scrollbar-track{background:transparent;}
 .sparkline-wrapper::-webkit-scrollbar-thumb{background:rgba(148,163,184,0.45);border-radius:999px;}
-.sparkline-scroll{display:inline-block;min-width:900px;position:relative;}
+
+.jump-latest-btn{
+  position:absolute;
+  top:8px;right:8px;
+  display:none;
+  align-items:center;gap:5px;
+  background:var(--text);color:#fff;
+  border:none;border-radius:999px;
+  padding:6px 13px;
+  font-size:.66rem;font-weight:600;
+  font-family:var(--font-zh);
+  cursor:pointer;
+  box-shadow:0 4px 14px rgba(0,0,0,0.18);
+  z-index:5;
+  transition:opacity .15s, transform .15s;
+}
+.jump-latest-btn:hover{transform:translateY(-1px)}
+.jump-latest-btn.show{display:flex}
+.sparkline-scroll{display:inline-block;min-width:100%;position:relative;}
 .spark-tooltip{
   position:absolute;pointer-events:none;
   padding:7px 10px;border-radius:14px;
@@ -656,6 +674,7 @@ body{
           </select>
         </div>
         <div class="sparkline-wrapper">
+          <button class="jump-latest-btn" id="jump-latest-btn">📍 看最新</button>
           <div class="sparkline-scroll">
             <svg id="sparkline" viewBox="0 0 900 220" preserveAspectRatio="none"></svg>
             <div id="spark-tooltip" class="spark-tooltip"></div>
@@ -817,7 +836,9 @@ import {
  getDatabase,
  ref,
  onValue,
- get
+ get,
+ query,
+ limitToLast
 } 
 from "https://www.gstatic.com/firebasejs/12.14.0/firebase-database.js";
 
@@ -894,6 +915,35 @@ function formatTime(ts){
 function formatLabelTime(ts){
   return new Date(ts*1000).toLocaleTimeString('zh-TW',{hour12:false,hour:'2-digit',minute:'2-digit'});
 }
+function downsample(data, maxPoints){
+  if(data.length<=maxPoints) return data;
+  const step = data.length/maxPoints;
+  const result=[];
+  for(let i=0;i<maxPoints;i++){
+    result.push(data[Math.floor(i*step)]);
+  }
+  result.push(data[data.length-1]);
+  return result;
+}
+
+// 是否跟著最新資料自動捲到最右邊。使用者手動拉走後會變 false，
+// 直到再拉回最右邊，或按下「看最新」按鈕才會恢復
+let followLatest = true;
+
+function isNearRightEdge(wrapper){
+  const tolerance = 24;
+  return wrapper.scrollWidth - wrapper.clientWidth - wrapper.scrollLeft <= tolerance;
+}
+
+function scrollToLatest(){
+  const wrapper = document.querySelector('.sparkline-wrapper');
+  if(!wrapper) return;
+  wrapper.scrollLeft = wrapper.scrollWidth;
+  followLatest = true;
+  const btn = document.getElementById('jump-latest-btn');
+  if(btn) btn.classList.remove('show');
+}
+
 function updateSparkline(hex){
   const svg=document.getElementById('sparkline');
   const axis=document.getElementById('sparkline-axis');
@@ -906,18 +956,25 @@ function updateSparkline(hex){
     if(rangeLabel) rangeLabel.textContent='範圍：暫無資料';
     if(countLabel) countLabel.textContent='筆數：0';
     tooltip.classList.remove('visible');
-    svg.style.width='900px';
+    svg.style.width='100%';
     svg.setAttribute('viewBox','0 0 900 220');
     return;
   }
-  const minWidth = 900;
-  const pointGap = 24;
-  const W = Math.max(minWidth, (hist.length-1) * pointGap);
+
+  // 資料筆數多時，最多取樣 300 個點，並保留可拖曳橫向捲動看更舊資料
+  // 但寬度有上限（最大約 3600px），不會像之前一樣無限增長
+  const MAX_POINTS = 300;
+  const sampled = downsample(hist, MAX_POINTS);
+
+  const pointGap = 12;
+  const minWidth = 900;   // 容器最小寬度（資料少時自動撐滿）
+  const maxWidth = 3600;  // 容器最大寬度上限
+  const W = Math.min(maxWidth, Math.max(minWidth, (sampled.length-1) * pointGap));
   const H = 180;
   const pad = 18;
   const maxV = 4095;
-  const step = hist.length > 1 ? W / (hist.length-1) : W;
-  const points = hist.map((item,i)=>{
+  const step = sampled.length > 1 ? W / (sampled.length-1) : W;
+  const points = sampled.map((item,i)=>{
     const x=i*step;
     const y=H-pad-(item.power/maxV)*(H-pad*2);
     return {x,y,time:formatTime(item.timestamp),value:item.power};
@@ -926,9 +983,10 @@ function updateSparkline(hex){
 
   svg.style.width = `${W}px`;
   svg.setAttribute('viewBox', `0 0 ${W} 220`);
+  svg.removeAttribute('preserveAspectRatio');
 
   // 【修改點 1】優化隱形觸發點：不渲染實體圓圈，改用透明的垂直矩形區域來偵測滑鼠，解決黏在一起的問題
-  const barWidth = Math.max(18, W / hist.length);
+  const barWidth = Math.max(6, W / sampled.length);
   const hoverAreas = points.map((p,index)=>`
       <rect class="spark-point" x="${Math.max(0,p.x - barWidth/2)}" y="0" width="${barWidth}" height="${H}" 
         fill="transparent" style="cursor:pointer;"
@@ -937,7 +995,7 @@ function updateSparkline(hex){
 
   // 【修改點 2】調細折線 stroke-width，讓曲線看起來更輕盈
   svg.innerHTML=`
-    <polyline points="${pts}" fill="none" stroke="${hex}" stroke-width="0.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <polyline points="${pts}" fill="none" stroke="${hex}" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
     ${hoverAreas}`;
 
   const eyes = [0, Math.floor((points.length-1)/2), points.length-1];
@@ -967,6 +1025,13 @@ function updateSparkline(hex){
       tooltip.classList.remove('visible');
     });
   });
+
+  // 如果使用者目前是「跟隨最新」狀態，每次資料更新後自動捲到最右邊
+  // 如果使用者已經手動拉去看舊資料，就不要打擾他，保持原本位置
+  const wrapper = document.querySelector('.sparkline-wrapper');
+  if(wrapper && followLatest){
+    requestAnimationFrame(()=>{ wrapper.scrollLeft = wrapper.scrollWidth; });
+  }
 }
 
 function updateGauge(raw,hex){
@@ -1088,35 +1153,35 @@ function setConn(state,msg){
   txt.textContent=msg;
 }
 
-async function loadHistory(){
+function listenHistory(){
 
+  // 只訂閱最近 1000 筆，避免資料越累積越多、越抓越慢
   const historyRef =
-      ref(db,"/FSR402/history");
+      query(ref(db,"/FSR402/history"), limitToLast(1000));
 
+  onValue(historyRef,(snap)=>{
 
-  const snap =
-      await get(historyRef);
+    if(!snap.exists()){
+        historyData=[];
+        filterHistory();
+        return;
+    }
 
+    const obj=snap.val();
 
-  if(!snap.exists()){
-      return;
-  }
+    historyData =
+        Object.values(obj);
 
+    historyData.sort(
+        (a,b)=>
+        a.timestamp-b.timestamp
+    );
 
-  const obj=snap.val();
+    filterHistory();
 
-
-  historyData =
-      Object.values(obj);
-
-
-  historyData.sort(
-      (a,b)=>
-      a.timestamp-b.timestamp
-  );
-
-
-  filterHistory();
+  },(err)=>{
+    console.error('history listen error',err);
+  });
 
 }
 
@@ -1189,6 +1254,45 @@ function filterHistory(){
 }
 
 document.getElementById('timeRange')?.addEventListener('change',filterHistory);
+
+// 滑鼠拖曳橫向捲動圖表（桌機用，手機原生觸控滑動已經可以用）
+(function enableDragScroll(){
+  const wrapper = document.querySelector('.sparkline-wrapper');
+  if(!wrapper) return;
+  let isDown=false, startX=0, startScroll=0;
+  wrapper.addEventListener('mousedown',(e)=>{
+    isDown=true;
+    startX=e.pageX;
+    startScroll=wrapper.scrollLeft;
+  });
+  window.addEventListener('mouseup',()=>{ isDown=false; });
+  window.addEventListener('mouseleave',()=>{ isDown=false; });
+  wrapper.addEventListener('mousemove',(e)=>{
+    if(!isDown) return;
+    e.preventDefault();
+    const dx = e.pageX - startX;
+    wrapper.scrollLeft = startScroll - dx;
+  });
+})();
+
+// 偵測使用者是否離開最右邊（拉去看舊資料），決定要不要顯示「看最新」按鈕
+(function watchScrollPosition(){
+  const wrapper = document.querySelector('.sparkline-wrapper');
+  const btn = document.getElementById('jump-latest-btn');
+  if(!wrapper || !btn) return;
+
+  wrapper.addEventListener('scroll',()=>{
+    if(isNearRightEdge(wrapper)){
+      followLatest = true;
+      btn.classList.remove('show');
+    } else {
+      followLatest = false;
+      btn.classList.add('show');
+    }
+  });
+
+  btn.addEventListener('click', scrollToLatest);
+})();
 
 
 function listen(){
@@ -1271,10 +1375,11 @@ function listen(){
 signInAnonymously(auth).then(()=>{
   document.getElementById('debug-log').textContent='驗證成功，監聽中...';
   listen();
-  loadHistory();
+  listenHistory();
 }).catch((e)=>{
   document.getElementById('debug-log').textContent='連線中 ('+e.code+')';
   listen();
+  listenHistory();
 });
 
 document.getElementById('resetPeakBtn').addEventListener('click',resetStats);
